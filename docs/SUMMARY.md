@@ -14,6 +14,7 @@
 * [Build from source](Build-from-source.md)
 * [Configure stealth and proxies](Configure-stealth-and-proxies.md)
 * [Markdown extraction](Markdown-extraction.md)
+* [Screenshots and rendering](Screenshots-and-rendering.md)
 * [Use with Puppeteer](Use-with-Puppeteer.md)
 * [Use with Playwright](Use-with-Playwright.md)
 * [Use the MCP server](Use-the-MCP-server.md)

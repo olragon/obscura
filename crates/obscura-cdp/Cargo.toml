@@ -19,6 +19,7 @@ anyhow = { workspace = true }
 futures-util = "0.3"
 base64 = "0.22"
 obscura-net = { workspace = true }
+obscura-render = { workspace = true }
 
 [target.'cfg(target_env = "gnu")'.dependencies]
 libc = "0.2"
@@ -26,3 +27,6 @@ libc = "0.2"
 [dev-dependencies]
 tokio-tungstenite = { workspace = true }
 futures-util = "0.3"
+# Screenshot tests decode the PNG they get back and assert on pixel colours —
+# asserting on size/magic-bytes alone cannot tell a correct render from a blank one.
+png = "0.17"

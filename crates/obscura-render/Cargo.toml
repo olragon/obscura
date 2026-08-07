@@ -1,0 +1,40 @@
+[package]
+name = "obscura-render"
+description = "Layout + paint for Obscura: turns a serialized DOM into PNG/JPEG pixels via Blitz + Vello CPU"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Blitz: HTML/CSS layout + paint. Pinned to the exact beta — the 0.3 betas are
+# not semver-compatible with each other.
+blitz-dom = "=0.3.0-beta.1"
+blitz-html = "=0.3.0-beta.1"
+blitz-paint = "=0.3.0-beta.1"
+blitz-net = "=0.3.0-beta.1"
+blitz-traits = "=0.3.0-beta.1"
+
+# Rasterization. vello_cpu is the SOFTWARE backend on purpose: a headless
+# server has no GPU, and a CPU raster is deterministic, which is what makes
+# screenshot output diffable in tests.
+#
+# ⚠️ These versions are load-bearing and must move together with blitz-paint.
+# `anyrender::PaintScene` is a TRAIT crossing the crate boundary, so cargo
+# resolving two semver-incompatible `anyrender` majors puts two *different*
+# `PaintScene` traits in the graph and `paint_scene()` stops accepting the
+# renderer — with a "multiple different versions of crate `anyrender`" note as
+# the only clue. blitz-paint 0.3.0-beta.1 depends on anyrender 0.11, so the
+# matching CPU backend is anyrender_vello_cpu 0.14 (0.15 moved to anyrender
+# 0.12). Check `blitz-paint`'s own anyrender req before bumping either.
+anyrender = "0.11.0"
+anyrender_vello_cpu = "0.14.0"
+peniko = "0.6.0"
+
+# Encoders
+png = "0.17"
+jpeg-encoder = "0.6"
+
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }

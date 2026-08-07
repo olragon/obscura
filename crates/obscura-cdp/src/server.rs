@@ -1227,7 +1227,15 @@ fn fast_path_response(text: &str) -> Option<String> {
         "Page.enable" | "Page.setLifecycleEventsEnabled" | "Page.setInterceptFileChooserDialog" |
         "Runtime.runIfWaitingForDebugger" | "Runtime.discardConsoleEntries" |
         "Performance.enable" | "Log.enable" | "Security.enable" |
-        "Emulation.setDeviceMetricsOverride" | "Emulation.setTouchEmulationEnabled" |
+        // NOTE: Emulation.setDeviceMetricsOverride is deliberately NOT here.
+        // It used to be, back when nothing consumed a viewport and answering
+        // `{}` from the fast path was free. Now that Page.captureScreenshot
+        // renders real pixels, that shortcut silently discarded every
+        // `page.setViewport()` — the handler in domains/emulation.rs was never
+        // reached, so captures came back at the 1280x720 default with no error.
+        // Anything that mutates state the renderer reads must go through the
+        // dispatcher; only genuinely stateless acks belong on this list.
+        "Emulation.setTouchEmulationEnabled" |
         "CSS.enable" | "Accessibility.enable" | "ServiceWorker.enable" |
         "Inspector.enable" | "Debugger.enable" | "Profiler.enable" |
         "HeapProfiler.enable" | "Overlay.enable" | "Storage.enable" |
@@ -1346,9 +1354,44 @@ async fn handle_connection_ws(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_navigate_method, merge_cookie_delta, parse_cdp_headers};
+    use super::{fast_path_response, is_navigate_method, merge_cookie_delta, parse_cdp_headers};
     use obscura_net::{CookieInfo, CookieJar};
     use serde_json::json;
+
+    /// The fast path answers a fixed `{}` without touching CdpContext, so any
+    /// method that MUTATES state the renderer later reads must not be on it.
+    ///
+    /// This is a regression test for a bug that every in-process dispatch test
+    /// was structurally blind to: those tests call `dispatch()` directly, while
+    /// a real client's frame hits `fast_path_response` first. The result was a
+    /// `page.setViewport()` that returned success and changed nothing, and a
+    /// screenshot silently rendered at the default size.
+    #[test]
+    fn fast_path_does_not_swallow_state_mutating_methods() {
+        for method in [
+            "Emulation.setDeviceMetricsOverride",
+            "Emulation.clearDeviceMetricsOverride",
+        ] {
+            let frame = json!({"id": 1, "method": method, "params": {}}).to_string();
+            assert!(
+                fast_path_response(&frame).is_none(),
+                "{method} must reach the dispatcher, not be acked by the fast path"
+            );
+        }
+    }
+
+    /// The stateless acks the fast path exists for must stay on it — removing
+    /// them would put a round-trip back into the Puppeteer connect handshake.
+    #[test]
+    fn fast_path_still_acks_stateless_connect_chatter() {
+        for method in ["Page.enable", "Network.enable", "Runtime.runIfWaitingForDebugger"] {
+            let frame = json!({"id": 1, "method": method, "params": {}}).to_string();
+            assert!(
+                fast_path_response(&frame).is_some(),
+                "{method} should still be fast-pathed"
+            );
+        }
+    }
 
     fn cookie(name: &str, value: &str) -> CookieInfo {
         CookieInfo {

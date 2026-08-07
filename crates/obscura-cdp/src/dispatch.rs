@@ -9,7 +9,36 @@ use crate::domains;
 use crate::domains::fetch::FetchInterceptState;
 use crate::types::{CdpEvent, CdpRequest, CdpResponse};
 
+/// The emulated viewport, as set by `Emulation.setDeviceMetricsOverride`.
+///
+/// This used to be a pair of magic numbers inside `Page.getLayoutMetrics` while
+/// the whole `Emulation` domain was an accept-and-discard no-op. That was
+/// harmless when nothing rendered, but once `Page.captureScreenshot` produces
+/// real pixels, a silently-ignored `page.setViewport()` means every client that
+/// asks for a mobile-width capture gets a 1280px desktop one and no error —
+/// so the override is now recorded and actually consumed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Viewport {
+    pub width: u32,
+    pub height: u32,
+    pub scale: f32,
+}
+
+impl Default for Viewport {
+    /// Chrome's default headless window, which is also what `getLayoutMetrics`
+    /// reported before this struct existed.
+    fn default() -> Self {
+        Self { width: 1280, height: 720, scale: 1.0 }
+    }
+}
+
 pub struct CdpContext {
+    /// Emulated viewport used by both `Page.getLayoutMetrics` and
+    /// `Page.captureScreenshot`. They must read the same value: Playwright
+    /// sizes its capture from the metrics call, so a screenshot rendered at a
+    /// different size than the metrics advertise produces silently mis-cropped
+    /// images.
+    pub viewport: Viewport,
     pub pages: Vec<Page>,
     pub sessions: HashMap<String, String>, // session_id -> page_id
     pub pending_events: Vec<CdpEvent>,
@@ -131,6 +160,7 @@ impl CdpContext {
             next_isolated_context_id: 100,
             io_streams: crate::domains::io::IoStreamStore::default(),
             v8_lock: Arc::new(tokio::sync::Mutex::new(())),
+            viewport: Viewport::default(),
         }
     }
 
@@ -393,7 +423,11 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         // Accepted but no-op. Puppeteer's FrameManager.initialize calls
         // Audits.enable on connect — refusing it breaks puppeteer.connect()
         // before any user code runs.
-        "Emulation" | "Log" | "Performance" | "Security" | "CSS"
+        // Emulation is no longer a blanket no-op: setDeviceMetricsOverride now
+        // actually resizes the render viewport. Everything else in the domain
+        // still no-ops, preserving the connect-path behaviour below.
+        "Emulation" => domains::emulation::handle(method, &req.params, ctx).await,
+        "Log" | "Performance" | "Security" | "CSS"
         | "ServiceWorker" | "Inspector"
         | "Debugger" | "Profiler" | "HeapProfiler" | "Overlay"
         | "Audits" => {

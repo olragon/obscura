@@ -2,6 +2,7 @@ pub mod target;
 pub mod browser;
 pub mod page;
 pub mod dom;
+pub mod emulation;
 pub mod domsnapshot;
 pub mod runtime;
 pub mod network;

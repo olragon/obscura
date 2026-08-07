@@ -5,6 +5,17 @@ use crate::dispatch::CdpContext;
 use crate::types::CdpEvent;
 use crate::util::url_is_file_scheme;
 
+/// How long a screenshot waits for stylesheets/images/fonts before painting
+/// whatever has arrived.
+///
+/// This is a wall-clock budget because waiting on the network is a time
+/// problem — an earlier pass-count version spent its whole budget in ~150 ms
+/// and rendered every externally-styled page completely unstyled. Three seconds
+/// covers a normal round-trip plus a slow CDN without letting one hung asset
+/// hold a CDP command open indefinitely (the command watchdog is the backstop
+/// beyond this).
+const SCREENSHOT_RESOURCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Emit the post-navigation event stream into `ctx.pending_events`. Shared
 /// by both the in-process `do_navigate` path and the spawned path in
 /// `server::process_navigation`, so the recent goto-returns-Response /
@@ -400,13 +411,14 @@ pub async fn handle(
         // configure; ack it so clients that set it do not warn (issue #340).
         "setDownloadBehavior" => Ok(json!({})),
         "getLayoutMetrics" => {
-            // Obscura has no visual layout engine, so we return a fixed
-            // 1280x720 viewport (Chrome's default) and try to derive the
-            // content height from document.documentElement.scrollHeight.
-            // Playwright calls this before every page.screenshot() and
-            // would otherwise fail with "Unknown Page method".
-            let width = 1280.0_f64;
-            let height = 720.0_f64;
+            // Reports the emulated viewport (Emulation.setDeviceMetricsOverride,
+            // defaulting to Chrome's 1280x720) and derives the content height
+            // from document.documentElement.scrollHeight. Playwright calls this
+            // before every page.screenshot() and sizes the capture from it, so
+            // it MUST agree with what Page.captureScreenshot actually renders —
+            // both now read ctx.viewport for exactly that reason.
+            let width = ctx.viewport.width as f64;
+            let height = ctx.viewport.height as f64;
             let content_height = ctx
                 .get_session_page_mut(session_id)
                 .map(|p| p.evaluate("document.documentElement && document.documentElement.scrollHeight"))
@@ -511,29 +523,121 @@ pub async fn handle(
             Ok(json!({}))
         }
         "printToPDF" => {
-            // Obscura has no layout/rendering engine, so PDF generation is
-            // intentionally not implemented. Returning a distinct, descriptive
-            // error (rather than the generic "Unknown Page method" fallback)
-            // tells Playwright/Puppeteer/headless_chrome clients exactly why
-            // the call failed and what to do instead.
+            // Still unimplemented, but for a narrower reason than before: the
+            // layout engine now exists (see captureScreenshot), what is missing
+            // is a PDF *backend*. Blitz paints into an `anyrender` scene, and
+            // wiring a vector-PDF backend is a separate piece of work from
+            // rasterizing — emitting a page-sized PNG wrapped in a PDF would be
+            // a worse lie than an honest error, because clients ask for PDF
+            // precisely when they want selectable text.
             Err(
-                "Page.printToPDF is not supported by Obscura: no layout engine. \
-                 Use Runtime.evaluate (e.g. page.evaluate) to extract the rendered \
-                 HTML, then render to PDF in your client (wkhtmltopdf, weasyprint, \
-                 a separate headless Chromium pipeline, etc.)."
+                "Page.printToPDF is not supported by Obscura: layout works, but there is \
+                 no PDF paint backend yet (only raster). Use Page.captureScreenshot for a \
+                 pixel capture, or Runtime.evaluate to extract HTML and render to PDF in \
+                 your client (weasyprint, wkhtmltopdf, ...)."
                     .to_string(),
             )
         }
-        "captureScreenshot" | "captureSnapshot" => {
-            // Same story as printToPDF: rasterising a page needs a layout and
-            // paint pipeline that Obscura intentionally does not have. Reply
-            // with a clear error so clients can fail fast instead of waiting
-            // on the generic "Unknown Page method" reply.
-            Err(format!(
-                "Page.{method} is not supported by Obscura: no layout or paint engine. \
-                 For visual snapshots, drive a real headless Chromium for the \
-                 screenshot leg of your pipeline and use Obscura for the scraping leg."
-            ))
+        "captureSnapshot" => {
+            // Distinct from captureScreenshot: this returns MHTML, a
+            // serialization format, not pixels. Splitting it out of the old
+            // shared arm means the screenshot support below does not imply
+            // support for a format we still do not produce.
+            Err(
+                "Page.captureSnapshot (MHTML) is not supported by Obscura. \
+                 Use Page.captureScreenshot for pixels, or DOM.getOuterHTML for markup."
+                    .to_string(),
+            )
+        }
+        "captureScreenshot" => {
+            let format = obscura_render::ImageFormat::from_cdp(
+                params.get("format").and_then(|v| v.as_str()),
+            )
+            .ok_or_else(|| {
+                format!(
+                    "Page.captureScreenshot: unsupported format {:?}; Obscura encodes png and jpeg",
+                    params.get("format").and_then(|v| v.as_str()).unwrap_or("?")
+                )
+            })?;
+
+            let quality = params
+                .get("quality")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(80)
+                .clamp(1, 100) as u8;
+
+            let clip = params.get("clip").and_then(|c| {
+                Some(obscura_render::Clip {
+                    x: c.get("x")?.as_f64()?,
+                    y: c.get("y")?.as_f64()?,
+                    width: c.get("width")?.as_f64()?,
+                    height: c.get("height")?.as_f64()?,
+                })
+            });
+
+            let full_page = params
+                .get("captureBeyondViewport")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            // Read before the mutable page borrow below.
+            let viewport = ctx.viewport;
+
+            let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+            // The post-JavaScript DOM is the whole point: scripts have already
+            // run and mutated the tree, and this serialization captures that
+            // state rather than the bytes that came off the wire.
+            let html = page
+                .with_dom(|dom| dom.outer_html(dom.document()))
+                .ok_or("No document to render")?;
+            let base_url = page.url.as_ref().map(|u| u.to_string());
+            tracing::debug!(
+                target: "obscura::render",
+                html_len = html.len(),
+                base_url = ?base_url,
+                "serialized DOM for screenshot"
+            );
+
+            let opts = obscura_render::RenderOptions {
+                width: viewport.width,
+                height: viewport.height,
+                scale: viewport.scale,
+                full_page,
+                format,
+                jpeg_quality: quality,
+                clip,
+                ..Default::default()
+            };
+
+            // Layout + raster is CPU-bound and synchronous, and this handler
+            // runs on the shared dispatcher. Blocking here would stall every
+            // other CDP session in the process — the same class of problem the
+            // V8 lock and the command watchdog already exist to prevent — so
+            // the render goes to the blocking pool.
+            let outcome = tokio::task::spawn_blocking(move || {
+                obscura_render::render_html(
+                    &html,
+                    base_url.as_deref(),
+                    &opts,
+                    SCREENSHOT_RESOURCE_TIMEOUT,
+                )
+            })
+            .await
+            .map_err(|e| format!("screenshot task failed: {e}"))?
+            .map_err(|e| format!("screenshot render failed: {e}"))?;
+
+            // A truncated or asset-less screenshot looks identical to a correct
+            // one, so any caveat is logged rather than dropped. It is not put in
+            // the CDP reply: `Page.captureScreenshot` has a fixed result shape
+            // and clients reject unknown fields.
+            for note in &outcome.fidelity_notes {
+                tracing::warn!(target: "obscura::render", "screenshot fidelity: {note}");
+            }
+
+            use base64::Engine as _;
+            Ok(json!({
+                "data": base64::engine::general_purpose::STANDARD.encode(&outcome.bytes)
+            }))
         }
         _ => Err(format!("Unknown Page method: {}", method)),
     }
@@ -621,32 +725,88 @@ mod tests {
         );
     }
 
-    /// Regression for #45: same idea as printToPDF for captureScreenshot.
-    /// Playwright's `page.screenshot()` calls Page.captureScreenshot via CDP;
-    /// without an explicit arm, clients see "Unknown Page method" and have
-    /// no idea why their screenshot request failed.
+    /// Was: "captureScreenshot returns a descriptive unsupported error"
+    /// (regression for #45). Obscura now has a paint pipeline, so the assertion
+    /// is inverted — but the *original* point of the test still has to hold:
+    /// the method must never fall through to the "Unknown Page method"
+    /// catch-all, whatever it does.
     #[tokio::test]
-    async fn capture_screenshot_returns_descriptive_unsupported_error() {
+    async fn capture_screenshot_is_routed_and_no_longer_reports_unsupported() {
         let mut ctx = CdpContext::new();
+        // With no attached page there is nothing to render; the failure must be
+        // about the missing page, NOT about the feature being absent.
         let err = handle("captureScreenshot", &json!({}), &mut ctx, &None)
             .await
-            .expect_err("captureScreenshot must error until a real paint exists");
+            .expect_err("no session page means no render");
         assert!(
             !err.contains("Unknown Page method"),
             "captureScreenshot must NOT fall through to the catch-all: {err}"
         );
         assert!(
-            err.contains("not supported by Obscura"),
-            "error must clearly state screenshot is unsupported: {err}"
+            !err.contains("no layout or paint engine"),
+            "the paint engine exists now; this error text is stale: {err}"
         );
-        // Same for the MHTML snapshot sibling method.
-        let err2 = handle("captureSnapshot", &json!({}), &mut ctx, &None)
+    }
+
+    /// `captureSnapshot` is MHTML, not pixels. It was previously handled in the
+    /// same arm as `captureScreenshot`, so implementing screenshots could
+    /// easily have made this one claim support it never gained.
+    #[tokio::test]
+    async fn capture_snapshot_mhtml_is_still_explicitly_unsupported() {
+        let mut ctx = CdpContext::new();
+        let err = handle("captureSnapshot", &json!({}), &mut ctx, &None)
             .await
-            .expect_err("captureSnapshot must error until a real renderer exists");
+            .expect_err("MHTML is still not produced");
         assert!(
-            !err2.contains("Unknown Page method"),
-            "captureSnapshot must NOT fall through: {err2}"
+            !err.contains("Unknown Page method"),
+            "captureSnapshot must NOT fall through: {err}"
         );
+        assert!(err.contains("MHTML"), "error should name the format: {err}");
+    }
+
+    /// An unencodable format must be refused rather than quietly answered with
+    /// PNG bytes — a client that asked for webp and got PNG under a `data` key
+    /// has no way to notice.
+    #[tokio::test]
+    async fn capture_screenshot_rejects_formats_it_cannot_encode() {
+        let mut ctx = CdpContext::new();
+        let err = handle(
+            "captureScreenshot",
+            &json!({"format": "webp"}),
+            &mut ctx,
+            &None,
+        )
+        .await
+        .expect_err("webp must be refused");
+        assert!(
+            err.contains("unsupported format"),
+            "must name the format problem, not the missing page: {err}"
+        );
+    }
+
+    /// getLayoutMetrics and captureScreenshot must read the SAME viewport.
+    /// Playwright sizes its capture from the metrics call, so if the two ever
+    /// disagree the returned image is silently mis-cropped.
+    #[tokio::test]
+    async fn layout_metrics_follow_the_emulated_viewport() {
+        let mut ctx = CdpContext::new();
+        crate::domains::emulation::handle(
+            "setDeviceMetricsOverride",
+            &json!({"width": 375, "height": 667}),
+            &mut ctx,
+        )
+        .await
+        .expect("override");
+
+        let result = handle("getLayoutMetrics", &json!({}), &mut ctx, &None)
+            .await
+            .expect("metrics");
+        assert_eq!(
+            result["layoutViewport"]["clientWidth"].as_f64(),
+            Some(375.0),
+            "metrics must report the emulated viewport, not a hardcoded 1280"
+        );
+        assert_eq!(result["layoutViewport"]["clientHeight"].as_f64(), Some(667.0));
     }
 
     #[tokio::test]
