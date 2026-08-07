@@ -427,12 +427,21 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         // actually resizes the render viewport. Everything else in the domain
         // still no-ops, preserving the connect-path behaviour below.
         "Emulation" => domains::emulation::handle(method, &req.params, ctx).await,
+        "Memory" => domains::memory::handle(method, &req.params, ctx).await,
         "Log" | "Performance" | "Security" | "CSS"
         | "ServiceWorker" | "Inspector"
         | "Debugger" | "Profiler" | "HeapProfiler" | "Overlay"
+        | "Console" | "Tracing" | "BackgroundService" | "Cast"
+        | "DeviceOrientation" | "Media" | "WebAuthn" | "SystemInfo"
         | "Audits" => {
             Ok(json!({}))
         }
+        // A domain we do not model at all still gets an error, but scripts that
+        // merely *touch* an unimplemented domain during setup are a large share
+        // of "it doesn't work with Obscura" reports, so the accept-and-no-op
+        // list above is deliberately generous. The line is drawn at domains
+        // whose whole purpose is to return data: answering those with `{}` would
+        // be a silent wrong answer rather than a harmless ack.
         _ => Err(format!("Unknown domain: {}", domain)),
     };
 
