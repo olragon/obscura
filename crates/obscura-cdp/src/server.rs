@@ -460,6 +460,7 @@ fn run_connection(
                 context_template.isolated_copy("default".to_string(), true),
             );
             let initial_cookies = default_context.cookie_jar.get_all_cookies();
+            let initial_storage = default_context.storage.snapshot_local();
             let persisted_context = default_context.clone();
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -504,6 +505,11 @@ fn run_connection(
                     &persistence_context.cookie_jar,
                     &initial_cookies,
                     &persisted_context.cookie_jar.get_all_cookies(),
+                );
+                merge_storage_delta(
+                    &persistence_context.storage,
+                    &initial_storage,
+                    &persisted_context.storage.snapshot_local(),
                 );
                 persistence_context.save_cookies();
             }
@@ -562,6 +568,46 @@ fn merge_cookie_delta(
         })
         .collect();
     destination.set_cookies_from_cdp(changed);
+}
+
+/// Write back only this connection's `localStorage` changes, per origin and
+/// per key — the storage twin of [`merge_cookie_delta`]. Copying the whole jar
+/// would make the last connection to disconnect the sole author of the file,
+/// silently dropping a login another connection had just stored.
+fn merge_storage_delta(
+    destination: &obscura_net::StorageJar,
+    initial: &std::collections::BTreeMap<String, Vec<(String, String)>>,
+    current: &std::collections::BTreeMap<String, Vec<(String, String)>>,
+) {
+    use obscura_net::StorageArea::Local;
+
+    for (origin, items) in current {
+        let before: HashMap<&str, &str> = initial
+            .get(origin)
+            .map(|v| v.iter().map(|(k, val)| (k.as_str(), val.as_str())).collect())
+            .unwrap_or_default();
+        for (key, value) in items {
+            if before.get(key.as_str()) != Some(&value.as_str()) {
+                let _ = destination.set_item(origin, Local, key, value);
+            }
+        }
+        let now: std::collections::HashSet<&str> =
+            items.iter().map(|(k, _)| k.as_str()).collect();
+        for key in before.keys() {
+            if !now.contains(key) {
+                destination.remove_item(origin, Local, key);
+            }
+        }
+    }
+
+    // An origin present initially and gone now was cleared by this connection.
+    for (origin, items) in initial {
+        if !current.contains_key(origin) {
+            for (key, _) in items {
+                destination.remove_item(origin, Local, key);
+            }
+        }
+    }
 }
 
 /// Turn away a connection that arrived while the server was at its limit.

@@ -416,6 +416,19 @@ impl CookieJar {
         }
     }
 
+    /// Remove every cookie for `domain` and its dot-prefixed variants. Backs
+    /// CDP `Storage.clearDataForOrigin`, where the caller names an origin and
+    /// expects the whole domain's jar to go — `delete_cookies_filtered` cannot
+    /// express that, since an empty name there matches only a cookie literally
+    /// named "".
+    pub fn clear_domain(&self, domain: &str) {
+        let bare = domain.trim_start_matches('.');
+        let mut cookies = self.cookies.write().unwrap();
+        for d in [bare.to_string(), format!(".{bare}")] {
+            cookies.remove(d.as_str());
+        }
+    }
+
     pub fn clear(&self) {
         self.cookies.write().unwrap().clear();
     }

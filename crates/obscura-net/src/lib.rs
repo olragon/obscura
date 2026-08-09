@@ -3,6 +3,7 @@ pub mod cookies;
 pub mod encoding;
 pub mod interceptor;
 pub mod robots;
+pub mod storage;
 pub mod blocklist;
 #[cfg(feature = "stealth")]
 pub mod wreq_client;
@@ -18,6 +19,9 @@ pub use encoding::{
     url_encode_query,
 };
 pub use robots::RobotsCache;
+pub use storage::{
+    origin_of, QuotaExceeded, StorageArea, StorageJar, QUOTA_BYTES, STORAGE_FILE,
+};
 pub use blocklist::is_blocked as is_tracker_blocked;
 #[cfg(feature = "stealth")]
 pub use wreq_client::{

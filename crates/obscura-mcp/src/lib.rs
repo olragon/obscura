@@ -79,11 +79,33 @@ pub struct BrowserState {
 
 impl BrowserState {
     pub fn new(proxy: Option<String>, user_agent: Option<String>, stealth: bool) -> Self {
+        Self::with_storage(proxy, user_agent, stealth, None, false)
+    }
+
+    /// MCP sessions used to be unconditionally ephemeral: `run()` never took a
+    /// storage directory, so the CLI's `--storage-dir` was silently ignored on
+    /// this transport and an agent's login vanished with the process. With a
+    /// directory, cookies *and* `localStorage` are restored on start and
+    /// written back after every tool call.
+    pub fn with_storage(
+        proxy: Option<String>,
+        user_agent: Option<String>,
+        stealth: bool,
+        storage_dir: Option<std::path::PathBuf>,
+        allow_private_network: bool,
+    ) -> Self {
         BrowserState {
             tabs: std::collections::BTreeMap::new(),
             active_tab: None,
             tab_counter: 0,
-            context: Arc::new(BrowserContext::with_options("mcp".to_string(), proxy, stealth)),
+            context: Arc::new(BrowserContext::with_storage_and_network(
+                "mcp".to_string(),
+                proxy,
+                stealth,
+                user_agent.clone(),
+                storage_dir,
+                allow_private_network,
+            )),
             user_agent,
             console_messages: Vec::new(),
             interactive_refs: HashMap::new(),
@@ -171,18 +193,37 @@ pub(crate) async fn dispatch(method: &str, id: Value, params: &Value, state: &mu
 }
 
 pub async fn run(proxy: Option<String>, user_agent: Option<String>, stealth: bool) -> Result<()> {
+    run_with_storage(proxy, user_agent, stealth, None, false).await
+}
+
+pub async fn run_with_storage(
+    proxy: Option<String>,
+    user_agent: Option<String>,
+    stealth: bool,
+    storage_dir: Option<std::path::PathBuf>,
+    allow_private_network: bool,
+) -> Result<()> {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
     let mut reader = BufReader::new(stdin);
     let mut writer = stdout;
 
-    let mut state = BrowserState::new(proxy, user_agent, stealth);
+    let mut state = BrowserState::with_storage(
+        proxy,
+        user_agent,
+        stealth,
+        storage_dir,
+        allow_private_network,
+    );
 
     loop {
         // MCP stdio transport: newline-delimited JSON (one message per line)
         let mut line = String::new();
         let n = reader.read_line(&mut line).await?;
         if n == 0 {
+            // Client hung up: flush the session before exiting, or everything
+            // the agent just did is lost.
+            state.context.save_cookies();
             return Ok(());
         }
 
@@ -202,7 +243,15 @@ pub async fn run(proxy: Option<String>, user_agent: Option<String>, stealth: boo
         }
 
         let id = msg.id.clone().unwrap_or(Value::Null);
+        let is_tool_call = msg.method == "tools/call";
         let response = dispatch(&msg.method, id, &msg.params, &mut state).await;
+        // Page script can write storage at any point during a tool call, so
+        // persist after each one rather than only at exit: an agent process
+        // that is killed mid-run should still keep the session it earned.
+        // Writes are atomic and the files are small.
+        if is_tool_call {
+            state.context.save_cookies();
+        }
 
         let mut body = serde_json::to_string(&response)?;
         body.push('\n');
@@ -581,18 +630,18 @@ fn handle_tools_list(id: Value) -> RpcResponse {
             },
             {
                 "name": "browser_storage_state",
-                "description": "Export the full authentication / session state (cookies + localStorage + sessionStorage) as a JSON object. Save this to skip a login on a subsequent run via browser_set_storage_state.",
+                "description": "Export the full authentication / session state as a Playwright-shaped storageState object: {cookies: [{name,value,domain,path,expires,httpOnly,secure,sameSite}], origins: [{origin, localStorage: [{name,value}]}]}. Covers every origin visited in this context, not just the current page. Does NOT include IndexedDB, Service Worker, or Cache Storage state (Playwright does not either). Save it to skip a login on a subsequent run via browser_set_storage_state.",
                 "inputSchema": { "type": "object", "properties": {} }
             },
             {
                 "name": "browser_set_storage_state",
-                "description": "Restore session state previously returned by browser_storage_state. Pass the JSON object. Use to bring an authenticated session back without re-logging in.",
+                "description": "Restore session state previously returned by browser_storage_state — or captured by Playwright (context.storageState()), whose shape is identical. Pass the JSON object. Applies before any navigation, so an authenticated session can be seeded on a blank browser.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "state": {
                             "type": "object",
-                            "description": "{cookies: [...], origins: [{origin, localStorage: [...], sessionStorage: [...]}]}"
+                            "description": "{cookies: [...], origins: [{origin, localStorage: [{name,value}], sessionStorage?: [{name,value}]}]}"
                         }
                     },
                     "required": ["state"]
@@ -1673,101 +1722,26 @@ fn tool_search(args: &Value, state: &mut BrowserState) -> Result<String, String>
     }
 }
 
-/// Export full session state: cookies + localStorage + sessionStorage
-/// for every origin the page knows about. Agents stash this between
-/// runs to skip a login flow.
+/// Export the session as a Playwright-shaped `storageState`.
+///
+/// This reads the BrowserContext's jars directly rather than evaluating JS in
+/// the live page, which is what it used to do. That old path could only ever
+/// see the *current* page's origin and only while a page was open, so a
+/// multi-origin login (the normal shape of SSO) exported partially and restored
+/// silently incomplete.
 fn tool_storage_state(state: &mut BrowserState) -> Result<String, String> {
-    let cookies: Vec<Value> = state.context.cookie_jar.get_all_cookies().iter().map(|c| json!({
-        "name": c.name,
-        "value": c.value,
-        "domain": c.domain,
-        "path": c.path,
-        "secure": c.secure,
-        "http_only": c.http_only,
-        "same_site": c.same_site,
-        "expires": c.expires,
-    })).collect();
-    // Pull localStorage + sessionStorage for the current page's origin.
-    let storage_js = r#"(function(){
-        var ls = [], ss = [];
-        try { for (var i = 0; i < localStorage.length; i++) { var k = localStorage.key(i); ls.push([k, localStorage.getItem(k)]); } } catch(e) {}
-        try { for (var j = 0; j < sessionStorage.length; j++) { var k2 = sessionStorage.key(j); ss.push([k2, sessionStorage.getItem(k2)]); } } catch(e) {}
-        return { origin: location.origin || '', localStorage: ls, sessionStorage: ss };
-    })()"#;
-    let storage = if state.active_tab.is_some() {
-        state.page_mut().evaluate(storage_js)
-    } else {
-        Value::Null
-    };
-    let origins = if storage.is_object() { vec![storage] } else { vec![] };
-    let out = json!({ "cookies": cookies, "origins": origins });
-    serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
+    serde_json::to_string_pretty(&state.context.storage_state()).map_err(|e| e.to_string())
 }
 
 fn tool_set_storage_state(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let s = args.get("state").ok_or("Missing state object")?;
-    let mut applied = 0u32;
-    // Cookies
-    if let Some(cookies) = s.get("cookies").and_then(Value::as_array) {
-        let parsed: Vec<obscura_net::CookieInfo> = cookies.iter().filter_map(|c| {
-            Some(obscura_net::CookieInfo {
-                name: c.get("name")?.as_str()?.to_string(),
-                value: c.get("value")?.as_str()?.to_string(),
-                domain: c.get("domain")?.as_str()?.to_string(),
-                path: c.get("path").and_then(Value::as_str).unwrap_or("/").to_string(),
-                secure: c.get("secure").and_then(Value::as_bool).unwrap_or(false),
-                http_only: c.get("http_only").and_then(Value::as_bool).unwrap_or(false),
-                same_site: c.get("same_site").and_then(Value::as_str).unwrap_or("").to_string(),
-                expires: c.get("expires").and_then(Value::as_i64),
-            })
-        }).collect();
-        applied += parsed.len() as u32;
-        state.context.cookie_jar.set_cookies_from_cdp(parsed);
-    }
-    // Storage (per origin). Only applies if there's an active page; we
-    // restore on whatever origin is currently loaded, which usually
-    // matches because agents navigate before restoring state.
-    if state.active_tab.is_some() {
-        if let Some(origins) = s.get("origins").and_then(Value::as_array) {
-            for origin_entry in origins {
-                let mut snippets = Vec::new();
-                if let Some(arr) = origin_entry.get("localStorage").and_then(Value::as_array) {
-                    for pair in arr {
-                        if let (Some(k), Some(v)) = (
-                            pair.get(0).and_then(Value::as_str),
-                            pair.get(1).and_then(Value::as_str),
-                        ) {
-                            snippets.push(format!(
-                                "try {{ localStorage.setItem({k},{v}); }} catch(e) {{}};",
-                                k = serde_json::to_string(k).unwrap(),
-                                v = serde_json::to_string(v).unwrap(),
-                            ));
-                            applied += 1;
-                        }
-                    }
-                }
-                if let Some(arr) = origin_entry.get("sessionStorage").and_then(Value::as_array) {
-                    for pair in arr {
-                        if let (Some(k), Some(v)) = (
-                            pair.get(0).and_then(Value::as_str),
-                            pair.get(1).and_then(Value::as_str),
-                        ) {
-                            snippets.push(format!(
-                                "try {{ sessionStorage.setItem({k},{v}); }} catch(e) {{}};",
-                                k = serde_json::to_string(k).unwrap(),
-                                v = serde_json::to_string(v).unwrap(),
-                            ));
-                            applied += 1;
-                        }
-                    }
-                }
-                if !snippets.is_empty() {
-                    let _ = state.page_mut().evaluate(&snippets.join("\n"));
-                }
-            }
-        }
-    }
-    Ok(format!("Restored {applied} state entries."))
+    let (cookies, items) = state.context.set_storage_state(s);
+    // Write through immediately: an agent that seeds a session and then has its
+    // process killed should still find the session on the next run.
+    state.context.save_cookies();
+    Ok(format!(
+        "Restored {cookies} cookie(s) and {items} storage item(s)."
+    ))
 }
 
 #[cfg(test)]

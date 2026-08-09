@@ -50,6 +50,45 @@ pub async fn handle(
             }
             Ok(json!({}))
         }
+        // `clearDataForOrigin` / `clearDataForStorageKey` take an explicit list
+        // of storage types precisely because "the data for an origin" is no
+        // longer one thing. We honour the two we actually hold (cookies, web
+        // storage) and ignore the rest rather than pretending to clear an
+        // IndexedDB we never implemented.
+        "clearDataForOrigin" | "clearDataForStorageKey" => {
+            let raw_origin = params
+                .get("origin")
+                .or_else(|| params.get("storageKey"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let types = params
+                .get("storageTypes")
+                .and_then(|v| v.as_str())
+                .unwrap_or("all");
+            let wants = |t: &str| types == "all" || types.split(',').any(|s| s.trim() == t);
+
+            if let Some(origin) = obscura_net::origin_of(raw_origin) {
+                let jar = ctx
+                    .get_session_page(session_id)
+                    .map(|page| page.context.storage.clone())
+                    .unwrap_or_else(|| ctx.default_context.storage.clone());
+                if types == "all" {
+                    jar.clear_origin(&origin);
+                } else if wants("local_storage") {
+                    jar.clear(&origin, obscura_net::StorageArea::Local);
+                }
+            }
+
+            if wants("cookies") {
+                if let Ok(parsed) = url::Url::parse(raw_origin) {
+                    if let Some(domain) = parsed.host_str() {
+                        cookie_jar_for(ctx, params, session_id)?.clear_domain(domain);
+                    }
+                }
+            }
+            Ok(json!({}))
+        }
+
         _ => Ok(json!({})),
     }
 }

@@ -8,7 +8,10 @@ use deno_core::OpState;
 use deno_core::Extension;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{DomTree, NodeData, NodeId};
-use obscura_net::{CallbackRegistry, CookieJar, ObscuraHttpClient, RequestInfo, ResourceType, Response};
+use obscura_net::{
+    CallbackRegistry, CookieJar, ObscuraHttpClient, RequestInfo, ResourceType, Response,
+    StorageArea, StorageJar,
+};
 #[cfg(feature = "stealth")]
 use obscura_net::StealthHttpClient;
 use tokio::sync::Mutex;
@@ -74,6 +77,10 @@ pub struct ObscuraState {
     pub title: String,
     pub blocked_urls: Vec<String>,
     pub cookie_jar: Option<Arc<CookieJar>>,
+    /// Origin-keyed `localStorage`/`sessionStorage`, shared with every other
+    /// page in the same BrowserContext. `None` leaves the JS shim on its
+    /// per-isolate in-memory fallback (what it always did before).
+    pub storage: Option<Arc<StorageJar>>,
     pub http_client: Option<Arc<ObscuraHttpClient>>,
     /// The owning page's passive on_request/on_response callbacks (issue
     /// #408). Page-scoped, so scripted fetch()/XHR observation stays local to
@@ -114,6 +121,7 @@ impl ObscuraState {
             title: String::new(),
             blocked_urls: Vec::new(),
             cookie_jar: None,
+            storage: None,
             http_client: None,
             callbacks: None,
             #[cfg(feature = "stealth")]
@@ -1463,6 +1471,101 @@ fn op_set_cookie(state: &OpState, #[string] cookie_str: &str) {
     jar.set_cookie_from_js(cookie_str, &url);
 }
 
+// ---------------------------------------------------------------------------
+// Web Storage (localStorage / sessionStorage)
+//
+// The area is named by JS; the *origin is not*. It is derived here from the
+// document URL the runtime holds, so page script cannot address another
+// origin's tokens by lying about its own. When the document has an opaque
+// origin (about:blank, data:, file:) these ops report "unavailable" and the JS
+// shim falls back to its per-isolate map — the pre-existing behaviour.
+// ---------------------------------------------------------------------------
+
+/// Resolve (jar, origin) for the current document, or `None` when storage is
+/// not backed (no jar wired, or an opaque origin).
+fn storage_target(state: &OpState, area: &str) -> Option<(Arc<StorageJar>, String, StorageArea)> {
+    let gs = state.borrow::<SharedState>().clone();
+    let gs = gs.borrow();
+    let jar = gs.storage.clone()?;
+    let origin = obscura_net::origin_of(&gs.url)?;
+    let area = StorageArea::from_str_area(area)?;
+    Some((jar, origin, area))
+}
+
+/// All items for the current origin/area as a JSON array of `[key, value]`
+/// pairs, in insertion order. An empty string means "not backed" — distinct
+/// from `[]`, which means "backed and empty".
+#[op2]
+#[string]
+fn op_storage_items(state: &OpState, #[string] area: &str) -> String {
+    match storage_target(state, area) {
+        Some((jar, origin, area)) => {
+            let items: Vec<[String; 2]> = jar
+                .items(&origin, area)
+                .into_iter()
+                .map(|(k, v)| [k, v])
+                .collect();
+            serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
+        }
+        None => String::new(),
+    }
+}
+
+/// JSON-encoded value for `key`: `""` = not backed, `"null"` = absent,
+/// otherwise a JSON string. Encoding sidesteps the ambiguity of an empty
+/// string, which is a legal stored value.
+#[op2]
+#[string]
+fn op_storage_get(state: &OpState, #[string] area: &str, #[string] key: &str) -> String {
+    match storage_target(state, area) {
+        Some((jar, origin, area)) => match jar.get_item(&origin, area, key) {
+            Some(v) => serde_json::to_string(&v).unwrap_or_else(|_| "null".to_string()),
+            None => "null".to_string(),
+        },
+        None => String::new(),
+    }
+}
+
+/// 0 = stored, 1 = quota exceeded (JS throws `QuotaExceededError`),
+/// 2 = not backed (JS falls back to its in-memory map).
+#[op2(fast)]
+fn op_storage_set(
+    state: &OpState,
+    #[string] area: &str,
+    #[string] key: &str,
+    #[string] value: &str,
+) -> i32 {
+    match storage_target(state, area) {
+        Some((jar, origin, area)) => match jar.set_item(&origin, area, key, value) {
+            Ok(()) => 0,
+            Err(_) => 1,
+        },
+        None => 2,
+    }
+}
+
+#[op2(fast)]
+fn op_storage_remove(state: &OpState, #[string] area: &str, #[string] key: &str) -> bool {
+    match storage_target(state, area) {
+        Some((jar, origin, area)) => {
+            jar.remove_item(&origin, area, key);
+            true
+        }
+        None => false,
+    }
+}
+
+#[op2(fast)]
+fn op_storage_clear(state: &OpState, #[string] area: &str) -> bool {
+    match storage_target(state, area) {
+        Some((jar, origin, area)) => {
+            jar.clear(&origin, area);
+            true
+        }
+        None => false,
+    }
+}
+
 #[op2(fast)]
 fn op_navigate(state: &OpState, #[string] url: &str, #[string] method: &str, #[string] body: &str) {
     let gs = state.borrow::<SharedState>().clone();
@@ -1954,6 +2057,11 @@ pub fn build_extension() -> Extension {
             op_fetch_url(),
             op_get_cookies(),
             op_set_cookie(),
+            op_storage_items(),
+            op_storage_get(),
+            op_storage_set(),
+            op_storage_remove(),
+            op_storage_clear(),
             op_navigate(),
             op_sleep(),
             op_binding_called(),

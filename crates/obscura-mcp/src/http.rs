@@ -179,11 +179,30 @@ fn cors_header(origin: Option<&str>, allowlist: Option<&str>) -> String {
 /// session (including the V8 runtime) is single-threaded and `!Send`, so we
 /// never need to move state across threads.
 pub async fn run(host: String, port: u16, proxy: Option<String>, user_agent: Option<String>, stealth: bool) -> Result<()> {
+    run_with_storage(host, port, proxy, user_agent, stealth, None, false).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_storage(
+    host: String,
+    port: u16,
+    proxy: Option<String>,
+    user_agent: Option<String>,
+    stealth: bool,
+    storage_dir: Option<std::path::PathBuf>,
+    allow_private_network: bool,
+) -> Result<()> {
     let addr: std::net::SocketAddr = format!("{}:{}", host, port).parse()?;
     let listener = TcpListener::bind(&addr).await?;
     tracing::info!("MCP HTTP server on http://{}:{}/mcp", host, port);
 
-    let mut state = BrowserState::new(proxy, user_agent, stealth);
+    let mut state = BrowserState::with_storage(
+        proxy,
+        user_agent,
+        stealth,
+        storage_dir,
+        allow_private_network,
+    );
     let allowed_origins = allowed_origins_env();
 
     loop {

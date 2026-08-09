@@ -170,6 +170,14 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().cookie_jar = Some(jar);
     }
 
+    /// Install the BrowserContext's Web Storage jar. Without it the JS
+    /// `localStorage`/`sessionStorage` shim stays per-isolate and in-memory, so
+    /// every navigation starts blank — which is exactly the "cookies persist
+    /// but tokens don't" session failure this wiring exists to close.
+    pub fn set_storage(&self, jar: std::sync::Arc<obscura_net::StorageJar>) {
+        self.state.borrow_mut().storage = Some(jar);
+    }
+
     pub fn set_http_client(&self, client: std::sync::Arc<obscura_net::ObscuraHttpClient>) {
         self.state.borrow_mut().http_client = Some(client);
     }

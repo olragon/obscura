@@ -5812,33 +5812,81 @@ globalThis.reportError = globalThis.reportError || ((e) => console.error(e));
 // the named getter/setter so length/key()/iteration stay in sync with the
 // backing map. Plain prototype methods alone could not intercept direct
 // property access, so `localStorage.foo = x` never updated length before.
+//
+// Both areas are backed by the Rust StorageJar on the BrowserContext, keyed by
+// the document's origin (computed in Rust from the page URL — JS never names
+// the origin). That is what makes a restored session actually restore: cookies
+// alone leave an SPA that keeps its JWT in localStorage logged out.
+//
+// When the document has an opaque origin (about:blank, data:, file:) the ops
+// report "not backed" and each store falls back to a per-isolate map, which is
+// what this shim always did. Availability is re-checked per call rather than
+// latched, because bootstrap runs before the first navigation sets the URL.
 globalThis.Storage = function Storage() {};
-Storage.prototype.getItem = function(k) { k = String(k); return Object.prototype.hasOwnProperty.call(this._data, k) ? this._data[k] : null; };
-Storage.prototype.setItem = function(k, v) { this._data[String(k)] = String(v); };
-Storage.prototype.removeItem = function(k) { delete this._data[String(k)]; };
-Storage.prototype.clear = function() { const d = this._data; for (const k in d) delete d[k]; };
-Storage.prototype.key = function(i) { const ks = Object.keys(this._data); i = i >>> 0; return i < ks.length ? ks[i] : null; };
-Object.defineProperty(Storage.prototype, 'length', { get: function() { return Object.keys(this._data).length; }, configurable: true });
+Storage.prototype.getItem = function(k) { return this._be.get(String(k)); };
+Storage.prototype.setItem = function(k, v) { this._be.set(String(k), String(v)); };
+Storage.prototype.removeItem = function(k) { this._be.remove(String(k)); };
+Storage.prototype.clear = function() { this._be.clear(); };
+Storage.prototype.key = function(i) { const ks = this._be.keys(); i = i >>> 0; return i < ks.length ? ks[i] : null; };
+Object.defineProperty(Storage.prototype, 'length', { get: function() { return this._be.keys().length; }, configurable: true });
 
-const _mkStore = () => {
+const _mkStore = (area) => {
+  // Per-isolate fallback for opaque origins.
+  const mem = Object.create(null);
+  const ops = Deno.core.ops;
+  const backed = () => ops.op_storage_items(area) !== "";
+  const be = {
+    get(k) {
+      const raw = ops.op_storage_get(area, k);
+      if (raw === "") return Object.prototype.hasOwnProperty.call(mem, k) ? mem[k] : null;
+      return JSON.parse(raw);
+    },
+    set(k, v) {
+      const rc = ops.op_storage_set(area, k, v);
+      if (rc === 1) {
+        const err = new Error("Setting the value of '" + k + "' exceeded the quota.");
+        err.name = "QuotaExceededError";
+        throw err;
+      }
+      if (rc === 2) mem[k] = v;
+    },
+    remove(k) { if (!ops.op_storage_remove(area, k)) delete mem[k]; },
+    clear() { if (!ops.op_storage_clear(area)) { for (const k in mem) delete mem[k]; } },
+    keys() {
+      const raw = ops.op_storage_items(area);
+      if (raw === "") return Object.keys(mem);
+      return JSON.parse(raw).map((pair) => pair[0]);
+    },
+    entries() {
+      const raw = ops.op_storage_items(area);
+      if (raw === "") return Object.keys(mem).map((k) => [k, mem[k]]);
+      return JSON.parse(raw);
+    },
+    has(k) {
+      if (!backed()) return Object.prototype.hasOwnProperty.call(mem, k);
+      return ops.op_storage_get(area, k) !== "null";
+    },
+  };
   const target = Object.create(Storage.prototype);
-  Object.defineProperty(target, '_data', { value: Object.create(null), writable: true, enumerable: false, configurable: true });
-  const isReal = (p) => p === '_data' || p === 'constructor' || (p in Storage.prototype);
+  Object.defineProperty(target, '_be', { value: be, writable: false, enumerable: false, configurable: true });
+  const isReal = (p) => p === '_be' || p === 'constructor' || (p in Storage.prototype);
   return new Proxy(target, {
-    get(t, p, recv) { if (typeof p === 'symbol' || isReal(p)) return Reflect.get(t, p, recv); const v = t.getItem(p); return v === null ? undefined : v; },
-    set(t, p, v, recv) { if (typeof p === 'symbol' || isReal(p)) return Reflect.set(t, p, v, recv); t.setItem(p, v); return true; },
-    has(t, p) { if (typeof p === 'symbol' || isReal(p)) return true; return Object.prototype.hasOwnProperty.call(t._data, p); },
-    deleteProperty(t, p) { if (typeof p === 'symbol' || isReal(p)) return Reflect.deleteProperty(t, p); t.removeItem(p); return true; },
-    ownKeys(t) { return Object.keys(t._data); },
+    get(t, p, recv) { if (typeof p === 'symbol' || isReal(p)) return Reflect.get(t, p, recv); const v = be.get(String(p)); return v === null ? undefined : v; },
+    set(t, p, v, recv) { if (typeof p === 'symbol' || isReal(p)) return Reflect.set(t, p, v, recv); be.set(String(p), String(v)); return true; },
+    has(t, p) { if (typeof p === 'symbol' || isReal(p)) return true; return be.has(String(p)); },
+    deleteProperty(t, p) { if (typeof p === 'symbol' || isReal(p)) return Reflect.deleteProperty(t, p); be.remove(String(p)); return true; },
+    ownKeys(t) { return be.keys(); },
     getOwnPropertyDescriptor(t, p) {
-      if (typeof p !== 'symbol' && Object.prototype.hasOwnProperty.call(t._data, p))
-        return { value: t._data[p], writable: true, enumerable: true, configurable: true };
+      if (typeof p !== 'symbol') {
+        const v = be.get(String(p));
+        if (v !== null) return { value: v, writable: true, enumerable: true, configurable: true };
+      }
       return Reflect.getOwnPropertyDescriptor(t, p);
     },
   });
 };
-globalThis.localStorage = _mkStore();
-globalThis.sessionStorage = _mkStore();
+globalThis.localStorage = _mkStore("local");
+globalThis.sessionStorage = _mkStore("session");
 
 globalThis.btoa = globalThis.btoa || ((s) => { const b = new TextEncoder().encode(s); const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=""; for(let i=0;i<b.length;i+=3){const a=b[i],bb=b[i+1]??0,cc=b[i+2]??0; r+=c[a>>2]+c[((a&3)<<4)|(bb>>4)]+(i+1<b.length?c[((bb&15)<<2)|(cc>>6)]:"=")+(i+2<b.length?c[cc&63]:"=");} return r; });
 globalThis.atob = globalThis.atob || ((s) => { const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=[]; for(let i=0;i<s.length;i+=4){const a=c.indexOf(s[i]),b=c.indexOf(s[i+1]),cc=c.indexOf(s[i+2]),d=c.indexOf(s[i+3]); r.push((a<<2)|(b>>4)); if(cc>=0)r.push(((b&15)<<4)|(cc>>2)); if(d>=0)r.push(((cc&3)<<6)|d);} return String.fromCharCode(...r); });

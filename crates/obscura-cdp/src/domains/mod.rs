@@ -9,6 +9,7 @@ pub mod network;
 pub mod fetch;
 pub mod io;
 pub mod input;
+pub mod domstorage;
 pub mod storage;
 pub mod accessibility;
 pub mod lp;

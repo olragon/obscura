@@ -157,7 +157,22 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
         "attachToTarget" => {
             let target_id = params.get("targetId").and_then(|v| v.as_str())
                 .ok_or("targetId required")?;
-            let session_id = format!("{}-session", target_id);
+            // Every attach needs its OWN session id. Returning the same
+            // `{target}-session` twice deadlocked `page.createCDPSession()`
+            // followed by any navigation: Puppeteer keys its session map by
+            // sessionId, so the second attach overwrote the Page's own session
+            // and `Page.navigate`'s reply was delivered to the wrong object,
+            // where nothing was waiting for it. The first attach keeps the
+            // historical id so existing clients and tests are unaffected.
+            let base = format!("{}-session", target_id);
+            let session_id = if ctx.sessions.contains_key(&base) {
+                (2..)
+                    .map(|n| format!("{base}-{n}"))
+                    .find(|candidate| !ctx.sessions.contains_key(candidate))
+                    .expect("session id space is unbounded")
+            } else {
+                base
+            };
             ctx.sessions.insert(session_id.clone(), target_id.to_string());
 
             if let Some(page) = ctx.get_page(target_id) {
@@ -351,6 +366,29 @@ mod tests {
             .expect("attachedToTarget event must be emitted");
         assert_eq!(attached_evt.params["sessionId"], "browser-session");
         assert_eq!(attached_evt.params["targetInfo"]["type"], "browser");
+    }
+
+    #[tokio::test]
+    async fn second_attach_to_a_target_gets_a_distinct_session() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+
+        let first = handle("attachToTarget", &json!({ "targetId": page_id }), &mut ctx)
+            .await
+            .expect("first attach should succeed");
+        let second = handle("attachToTarget", &json!({ "targetId": page_id }), &mut ctx)
+            .await
+            .expect("second attach should succeed");
+
+        // The first keeps the historical id; the second must not collide, or a
+        // client that keys its session map by sessionId (Puppeteer does) loses
+        // the page's own session and every later navigation hangs.
+        assert_eq!(first["sessionId"], format!("{page_id}-session"));
+        assert_ne!(first["sessionId"], second["sessionId"]);
+        for sid in [&first["sessionId"], &second["sessionId"]] {
+            let sid = sid.as_str().unwrap();
+            assert_eq!(ctx.sessions.get(sid).map(String::as_str), Some(page_id.as_str()));
+        }
     }
 
     #[tokio::test]

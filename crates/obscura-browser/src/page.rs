@@ -339,6 +339,7 @@ impl Page {
         }
 
         rt.set_cookie_jar(self.context.cookie_jar.clone());
+        rt.set_storage(self.context.storage.clone());
         rt.set_http_client(self.http_client.clone());
         rt.set_callbacks(self.callbacks.clone());
         rt.set_blocked_urls(self.blocked_url_patterns.clone());
